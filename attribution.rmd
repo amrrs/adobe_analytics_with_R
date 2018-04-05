@@ -1,0 +1,291 @@
+---
+title: "Algorithmic Attribution"
+author: "Trevor Paulsen"
+output: html_notebook
+---
+
+## Loading the data
+Load the Data Feed data, classifications, and friendly names into Spark.
+
+```{r}
+# Load the libraries
+library(dplyr)
+library(sparklyr)
+setwd("/data")
+
+# Open a Spark connection
+sc = spark_connect(master="local", version="2.2.0", config=sconfig)
+
+# Or if you can connect to a cluster:
+sc = spark_connect(master="spark://IP_ADDRESS:7077", spark_home="/[SPARK_HOME_DIRECTORY]/spark/spark-2.2.0-bin-hadoop2.7/", version="2.2.0", config=sconfig)
+
+# Read in the Data Feed Files
+data_feed_local = spark_read_csv(
+  sc=sc, 
+  name="data_feed", 
+  path="01-my.data.feed_2018-*.tsv.gz", 
+  header=FALSE, 
+  delimiter="\t"
+)
+
+# Read in my classification file
+campaign_class_local = spark_read_csv(
+  sc = sc, 
+  name = "campaign_class", 
+  path = "SC_EXPORT_campaigns_classifications_file.tab", 
+  header = TRUE, 
+  delimiter = "\t"
+)
+
+# Read Lookup File (for "friendly" names)
+# This file comes with the Data Feed
+col_names = read.csv(
+  file="column_headers.tsv", 
+  header=FALSE, 
+  sep="\t"
+)
+
+# Pre-baked preview
+t(col_names)
+```
+
+
+## Data Prep
+Here, we'll give the Data Feed data some friendly names, and join the classification data to it.
+
+```{r}
+# Give data friendly names
+data_feed_tbl = data_feed_local %>%
+  mutate(
+    merged_visitor_ids = paste0(V1,"_",V2),
+    fixed_event_list = paste0(",",V5,",")
+  ) %>%
+  select(
+    visitor_id = merged_visitor_ids,
+    visit_num = V3,
+    hit_time_gmt = V4,
+    post_event_list = fixed_event_list,
+    post_campaign = V6
+  )
+
+data_feed_tbl = data_feed_tbl %>%
+  left_join(campaign_class_local, by=c("post_campaign"="Key"))
+
+data_feed_tbl = data_feed_tbl %>%
+  mutate(
+    mid_campaign = ifelse(post_event_list %regexp% ",20,", Channel, NA),
+    conversion = ifelse(post_event_list %regexp% ",1,", 1, 0)
+  )
+
+# Prebaked preview:
+data_peek1
+
+```
+
+
+## Attribution Prep
+For the next step, we're going to create a new column to isolate individual sequences of events that ended in an order.
+
+```{r}
+# Constructing order sequences for all visitors
+data_feed_tbl = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  arrange(hit_time_gmt) %>%
+  mutate(order_seq = ifelse(conversion > 0, 1, NA)) %>%
+  mutate(order_seq = lag(cumsum(ifelse(is.na(order_seq), 0, order_seq)))) %>%
+  mutate(order_seq = ifelse((row_number() == 1) & (post_event_list %regexp% ",1,"), -1, ifelse(row_number() == 1, 0, order_seq))) %>%
+  group_by(visitor_id, order_seq) %>%
+  mutate(
+    order_seq = ifelse(sum(conversion)>0, order_seq, NA)
+  ) %>% ungroup() %>% ungroup()
+
+# Prebaked preview:
+data_peek2
+```
+
+
+# Rules-Based Multi-Touch Attribution
+Now we'll show you how to do a few position based attribution rules before we do the algorithmic stuff.
+
+```{r}
+# Focus only on sequences that actually had an order
+attributable_sequences = data_feed_tbl %>%
+  filter(!is.na(mid_campaign) & !is.na(order_seq))
+
+# Last touch attribution
+last_touch_orders = attributable_sequences %>%
+  group_by(visitor_id, order_seq) %>%
+  top_n(1,hit_time_gmt) %>%
+  select(visitor_id, order_seq, mid_campaign) %>%
+  ungroup() %>%
+  group_by(mid_campaign) %>%
+  summarize(orders = n()) %>% collect()
+
+# First touch attribution
+first_touch_orders = attributable_sequences %>%
+  group_by(visitor_id, order_seq) %>%
+  top_n(1,-hit_time_gmt) %>%
+  select(visitor_id, order_seq, mid_campaign) %>%
+  ungroup() %>%
+  group_by(mid_campaign) %>%
+  summarize(orders = n()) %>% collect()
+
+# Linear (even) attribution
+linear_orders = attributable_sequences %>%
+  group_by(visitor_id, order_seq) %>%
+  mutate(
+    order_participation = 1/n()
+  ) %>%
+  ungroup() %>%
+  group_by(mid_campaign) %>%
+  summarize(orders = sum(order_participation)) %>% collect()
+linear_orders$orders = round(linear_orders$orders)
+
+# Time decay (half life) attribution
+half_life = 7*24*60*60
+half_life_orders = attributable_sequences %>%
+  group_by(visitor_id, order_seq) %>%
+  mutate(
+    order_participation = 0.5^((hit_time_gmt - min(hit_time_gmt))*1/half_life),
+    order_participation = order_participation/sum(order_participation)
+  ) %>%
+  ungroup() %>%
+  group_by(mid_campaign) %>%
+  summarize(orders = sum(order_participation)) %>% collect()
+half_life_orders$orders = round(half_life_orders$orders)
+
+# U shaped (AKA "starter player closer")
+u_shaped_orders = attributable_sequences %>%
+  group_by(visitor_id, order_seq) %>%
+  mutate(
+    order_participation = 
+      ifelse(n() == 1, 1,
+        ifelse(n() == 2, 0.5,
+          ifelse(hit_time_gmt == max(hit_time_gmt), 0.4,
+            ifelse(hit_time_gmt == min(hit_time_gmt), 0.4,
+              0.2/(n()-2)
+            )
+          )
+        )
+      )
+  ) %>%
+  ungroup() %>%
+  group_by(mid_campaign) %>%
+  summarize(orders = sum(order_participation)) %>% collect()
+u_shaped_orders$orders = round(u_shaped_orders$orders)
+
+
+
+
+# Prebaked preview:
+p <- plot_ly(model_comparison1, x = ~ model_comparison1$Marketing.Channel, y = ~model_comparison1$Last.Touch, type = 'bar', name = 'Last Touch') %>%
+  add_trace(y = ~model_comparison1$First.Touch, name = 'First Touch') %>%
+  add_trace(y = ~model_comparison1$Linear, name = 'Linear') %>%
+  add_trace(y = ~model_comparison1$Half.Life, name = 'Half Life') %>%
+  add_trace(y = ~model_comparison1$U.Shaped, name = 'U-Shaped') %>%
+  layout(yaxis = list(title = 'Orders'), barmode = 'group') %>%
+  layout(xaxis = list(title = 'Marketing Channel'))
+p
+model_comparison1
+
+```
+
+
+## Algorithmic Attribution
+Now we'll explore how to do attribution in a smarter way using a cooperative game theory concept known as Shapley Value.
+This is more complex, and you can find a more detailed explanation on how to do Shapley Value and more at Trevor's blog here: 
+http://datafeedtoolbox.com/attribution-theory-the-two-best-models-for-algorithmic-marketing-attribution-implemented-in-apache-spark-and-r/
+
+```{r}
+# Summarizing Order Sequences
+seq_summaries = data_feed_tbl %>%
+  group_by(visitor_id, order_seq) %>%
+  summarize(
+    email_touches = max(ifelse(mid_campaign == "Email",1,0)),
+    natural_search_touches = max(ifelse(mid_campaign == "Natural_Search",1,0)),
+    affiliate_touches = max(ifelse(mid_campaign == "Affiliates",1,0)),
+    paid_search_touches = max(ifelse(mid_campaign == "Paid_Search",1,0)),
+    display_touches = max(ifelse(mid_campaign == "Display",1,0)),
+    social_touches = max(ifelse(mid_campaign == "Social_Media",1,0)),
+    conversions = sum(conversion)
+  ) %>% ungroup()
+
+conv_rates = seq_summaries %>%
+  group_by(email_touches,
+           natural_search_touches,
+           affiliate_touches,
+           paid_search_touches,
+           display_touches,
+           social_touches) %>%
+  summarize(
+    conversions = sum(conversions),
+    total_sequences = n()
+  ) %>% collect()
+
+library(GameTheoryAllocation)
+
+number_of_channels = 6
+touch_combos = as.data.frame(coalitions(number_of_channels)$Binary)
+names(touch_combos) = c("Email","Natural_Search","Affiliates","Paid_Search","Display","Social_Media")
+
+touch_combo_conv_rate = left_join(touch_combos, conv_rates, 
+                                  by = c(
+                                    "Email"="email_touches",
+                                    "Natural_Search" = "natural_search_touches",
+                                    "Affiliates" = "affiliate_touches",
+                                    "Paid_Search" = "paid_search_touches",
+                                    "Display" = "display_touches",
+                                    "Social_Media" = "social_touches"
+                                  )
+)
+
+touch_combo_conv_rate = touch_combo_conv_rate %>%
+  mutate_all(funs(ifelse(is.na(.),0,.))) %>%
+  mutate(
+    conv_rate = ifelse(total_sequences >0, conversions/total_sequences, 0)
+  )
+
+
+#Building Shapley Values for each combo
+shap_vals = as.data.frame(coalitions(number_of_channels)$Binary)
+names(shap_vals) = c("Email","Natural_Search","Affiliates","Paid_Search","Display","Social_Media")
+coalition_mat = shap_vals
+shap_vals[2^number_of_channels,] = Shapley_value(touch_combo_conv_rate$conv_rate, game="profit")
+
+for(i in 2:(2^number_of_channels-1)){
+  if(sum(coalition_mat[i,]) == 1){
+    shap_vals[i,which(shap_vals[i,]==1)] = touch_combo_conv_rate[i,"conv_rate"]
+  }else if(sum(coalition_mat[i,]) > 1){
+    if(sum(coalition_mat[i,]) < number_of_channels){
+      channels_of_interest = which(coalition_mat[i,] == 1)
+      char_func = data.frame(rates = touch_combo_conv_rate[1,"conv_rate"])
+      for(j in 2:i){
+        if(sum(coalition_mat[j,channels_of_interest])>0 & sum(coalition_mat[j,-channels_of_interest])==0)
+          char_func = rbind(char_func,touch_combo_conv_rate[j,"conv_rate"])
+      }
+      shap_vals[i,channels_of_interest] = Shapley_value(char_func$rates, game="profit")
+    } 
+  }
+}
+
+
+# Prebaked preview:
+p <- plot_ly(model_comparison2, x = ~ model_comparison2$Marketing.Channel, y = ~model_comparison2$Last.Touch, type = 'bar', name = 'Last Touch') %>%
+  add_trace(y = ~model_comparison2$First.Touch, name = 'First Touch') %>%
+  add_trace(y = ~model_comparison2$Linear, name = 'Linear') %>%
+  add_trace(y = ~model_comparison2$Half.Life, name = 'Half Life') %>%
+  add_trace(y = ~model_comparison2$U.Shaped, name = 'U-Shaped') %>%
+  add_trace(y = ~model_comparison2$Shapley.Value, name = 'Algorithmic') %>%
+  layout(yaxis = list(title = 'Orders'), barmode = 'group') %>%
+  layout(xaxis = list(title = 'Marketing Channel'))
+p
+model_comparison2
+```
+
+
+
+
+
+
+
+

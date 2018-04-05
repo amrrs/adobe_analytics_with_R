@@ -1,0 +1,182 @@
+---
+title: "Adobe Analytics Site Search"
+output: html_notebook
+---
+
+## Setup
+Load libraries, get the various credentials, set the RSID and date range, and specify which eVar and event to use.
+
+```{r setup, message=FALSE, echo=FALSE}
+# Load libraries.
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(RSiteCatalyst,   # For pulling the data (thanks, Randy Zwitch!)
+               tidyverse,       # For manipulating the data
+               tidytext,        # For manipulating text data, specifically
+               DT,              # To give us interactivity in the tables
+               tm,              # For removing stopwords
+               SnowballC,       # For stemming / text mining
+               wordcloud)       # For making a pie chart (not really)
+
+# Specify the appropriate eVar and event for site search data
+evar_sitesearch <- Sys.getenv("ADOBE_EVAR_SS3")
+
+# This can be any metric (searches, null searches, orders, revenue...)
+event_sitesearch <- Sys.getenv("ADOBE_EVENT_SS3") 
+
+```
+
+## Pull the Site Search Data
+Run the query to pull the raw data and do a little bit of cleanup on it. 
+
+```{r get_data, message=FALSE, echo=FALSE}
+
+# Check if the data has already been pulled. If not, then pull the data
+if(length(which(list.files() == "site_searches.rds")) != 0){
+  
+  # The data exists and has been saved, so read it in
+  site_searches <- readRDS("site_searches.rds")
+  
+} else {
+  
+  # Load the username, shared secret, and RSID from .Renviron
+  username <- Sys.getenv("ADOBE_API_USERNAME_SS3")
+  secret <- Sys.getenv("ADOBE_API_SECRET_SS3")
+  
+  # Authorize Adobe Aalytics.
+  SCAuth(username, secret)
+  
+  # Set the RSID and the date range.
+  rsid <- Sys.getenv("ADOBE_RSID_SS3")
+  start_date <- Sys.Date() - 31        # 30 days back from yesterday
+  end_date <- Sys.Date() - 1           # Yesterday
+  
+  # Pull the raw data
+  site_searches <- QueueRanked(rsid,
+                               date.from = start_date,
+                               date.to = end_date,
+                               metrics = event_sitesearch,
+                               elements = evar_sitesearch,
+                               top = 50000)
+}
+
+# Show the top few rows
+head(site_searches, 20)
+```
+
+Clean up the data a bit by removing extraneous columns and renaming the remaining ones.
+
+```{r data_cleanup, message=FALSE, echo=FALSE}
+
+# The above comes back with some unnecessary columns. Remove 'em.
+site_searches <- select(site_searches, -url, -segment.id, -segment.name)
+
+# Update the column names to be more descriptive
+names(site_searches) <- c("search_term","metric")
+
+# Check out the results to make sure they look right
+head(site_searches, 20)
+
+```
+
+## Get the List of Questions Asked in Search
+
+The following search phrases started with a "question" word: who, what, why, when, where, or how. While these are typically low-frequency searches, they represent the voice of the customer with a high degree of specificity.*
+
+```{r search_questions, message=FALSE, echo=FALSE}
+
+# Subset the data to get the questions
+site_search_questions <- site_searches %>% 
+  filter(grepl("^(who|what|why|when|where|how)\\ ", search_term))
+
+# Display the questions
+datatable(site_search_questions,
+          rownames = FALSE,
+          options = list(columnDefs = list(list(className = 'dt-left', targets = 0))))
+
+```
+
+_* This filtering of site searches was something [Nancy Koons](https://www.linkedin.com/in/nkoons/) presented at Adobe Summit as part of Analytics Idol some years ago. Just because it's an oldie doesn't mean it isn't a goodie!_
+
+## Create a Word Cloud with the Raw Data
+
+Let's start with a word cloud without _any_ additional cleanup of the data.
+
+```{r word_cloud_raw, message=FALSE, echo=FALSE}
+
+# Set a seed so the same wordcloud will be generated every time with the same data.
+set.seed(1120)
+
+# Set the color palette to use
+palette <- rev(brewer.pal(8,"Spectral")) 
+
+# Generate the word cloud
+wordcloud(site_searches$search_term,
+          freq = site_searches$metric,  # The 'frequency' (volume) of the term's usage
+          scale=c(4,0.2),               # Max/min size of words
+          max.words = 500,              # Max # of search terms to include in the wordcloud
+          min.freq = 5,                 # Cutoff for # of searches to include a term
+          random.order = FALSE,
+          rot.per = 0,                  # % of words to rotate 90 degrees
+          colors = palette)
+
+```
+
+## Build and Output a (Better) Word Cloud
+
+This is the word cloud with stemming, removal of stopwords, and the removal of selected words that are not of interest.
+
+```{r word_cloud, message=FALSE, echo=FALSE}
+
+# Enter words to exclude from the word cloud. These will be applied *after*
+# stemming, so keep that in mind
+exclusion_terms <- "voonex"
+
+# Make a copy of the site search data frame for munging for the wordcloud
+wordcloud_df <- site_searches
+
+# Convert UTF-8 to ASCII (needed because tm doesn't seem to like UTF-8 accented characters)
+wordcloud_df$search_term <- iconv(wordcloud_df$search_term, "UTF-8", "ASCII") 
+
+# Split out phrases to be individual words (and convert to lowercase)
+# "dogs and cats" | 3
+# "kittens"       | 2
+# Becomes:
+# "dogs"          | 3
+# "and"           | 3
+# "cats"          | 3
+# "kittens"       | 2
+wordcloud_df <- unnest_tokens(wordcloud_df, 
+                     output = search_term, 
+                     input = search_term)
+
+# Remove stopwords: a, the, as, etc. 
+wordcloud_df <- wordcloud_df %>%
+  filter(!search_term %in% stopwords(kind = "en"))
+  
+# Perform stemming (e.g., "computer" and "computers" and "compute" all  become "comput")
+wordcloud_df <- wordcloud_df %>%
+  mutate(search_term = wordStem(search_term))
+
+# Pull out the exclusion terms
+wordcloud_df <- wordcloud_df %>% 
+  filter(!search_term %in% exclusion_terms)
+
+# Collapse the table. This will combine terms after stemming
+wordcloud_df <- wordcloud_df %>%
+  group_by(search_term) %>% 
+  summarise(metric = sum(metric)) %>% 
+  arrange(-metric)
+
+# Generate the word cloud
+wordcloud(wordcloud_df$search_term,wordcloud_df$metric, 
+          scale=c(4,0.2),      # Max/min size of words
+          max.words = 500,       # Max # of search terms to include in the wordcloud
+          min.freq = 5,          # Cutoff for # of searches to include a term
+          random.order = FALSE,
+          rot.per = 0,           # % of words to rotate 90 degrees
+          colors = palette)
+
+```
+
+The following terms have been removed for clarity: `r paste(exclusion_terms, collapse=", ")`.
+

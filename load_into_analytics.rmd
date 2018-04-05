@@ -1,0 +1,77 @@
+---
+title: "Load Into Workspace"
+author: "Trevor Paulsen"
+output: html_document
+---
+
+## Convert Data Feed Visitor IDs to Hex
+The first step is translating the visitor IDs into a format that customer attributes will understand.
+
+```{r}
+library(Rmpfr)
+library(parallel)
+library(RCurl)
+
+# Convert the integer visitor IDs to hex visitor IDs
+convert_to_hex = function(visitor_id){
+  visid_hi = toupper(as.character(formatMpfr(mpfr(strsplit(visitor_id,"_")[[1]][1], base=10), base=16, drop0trailing=TRUE)))
+  visid_lo = toupper(as.character(formatMpfr(mpfr(strsplit(visitor_id,"_")[[1]][2], base=10), base=16, drop0trailing=TRUE)))
+  visitor_id_hex = paste0(visid_hi,"-",visid_lo)
+  return(visitor_id_hex)
+}
+n_cores = detectCores() - 1
+cl = makeCluster(n_cores, type="FORK")
+hex_visitor_ids = parLapply(cl, local_visitor_rollup$visitor_id, convert_to_hex)
+stopCluster(cl)
+hex_visitor_ids = as.data.frame(unlist(hex_visitor_ids))
+
+# Prebaked Example:
+visitor_ids_converted_example
+
+```
+
+
+## Save off file for Customer Attribute Import
+Next, we'll save a file that can be imported to the Customer Attributes feature.
+
+```{r}
+# Combine propensity scores with hex values we created
+propensity_mapping = data.frame(hex_visitor_ids, propensity_scores)
+names(propensity_mapping) = c("aaid", "propensity_scores")
+
+# Write the lookup to a file
+write.table(propensity_mapping, file="propensity_mapping.csv", sep=",", row.names = FALSE, quot=FALSE)
+
+# Prebaked Example
+propensity_mapping_example
+```
+
+
+## Fire off "setCustomerID" a bunch of times
+Now we'll actually load the data into Analytics by spoofing a setCustomerID API call.
+I've heard there's a way to do this via batch ingest, but it's not documented...
+
+What's cool about this is you don't even have to have MCID implemented for this to work!
+
+```{r}
+# Parallel setCustomerID a zillion times
+responses = mclapply(cluster_mapping$aaid, function(aaid){
+  org_id = "<YOUR IMS ORG>@AdobeOrg"
+  url = paste0("https://dpm.demdex.net/id?",
+               "d_visid_ver=1.8.0&",
+               "d_fieldgroup=AAM&",
+               "d_rtbd=json&",
+               "d_ver=2&",
+               "d_orgid=", org_id, "&",
+               "d_nsid=0&",
+               "d_blob=NRX38WO0n5BH8Th-nqAG_A&",
+               "d_cid_ic=AVID%01", aaid, "&",
+               "d_cid_ic=aaid%01", aaid, "&",
+               "ts=1491014875614"
+  )
+  response = getURL(url = url, ssl.verifyhost = FALSE, ssl.verifypeer = FALSE, followlocation = TRUE)
+  return(response)
+}, mc.cores=7)
+
+```
+

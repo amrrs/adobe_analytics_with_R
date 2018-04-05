@@ -1,0 +1,146 @@
+---
+title: "Propensity Modeling"
+author: "Trevor Paulsen"
+output: html_document
+---
+
+## Load the Data
+For this example, we'll use Data Feeds again, however we'll need a lot more columns than we did for attribution. That's because the relevant data points for your customers are probably spread across many dimensions and metrics.
+
+```{r}
+# Load the libraries
+library(dplyr)
+library(sparklyr)
+setwd("/data")
+
+# Open a Spark connection
+sc = spark_connect(master="local", version="2.2.0", config=sconfig)
+
+# Or if you can connect to a cluster:
+sc = spark_connect(master="spark://IP_ADDRESS:7077", spark_home="/[SPARK_HOME_DIRECTORY]/spark/spark-2.2.0-bin-hadoop2.7/", version="2.2.0", config=sconfig)
+
+# Read in the Data Feed Files
+data_feed_local = spark_read_csv(
+  sc=sc, 
+  name="data_feed", 
+  path="01-my.data.feed_2018-*.tsv.gz", 
+  header=FALSE, 
+  delimiter="\t"
+)
+
+# Give the columns friendly names
+data_feed_tbl = data_feed_local %>%
+  mutate(merged_visitor_ids = paste0(V1,"_",V2)) %>%
+  select(
+     visitor_id = merged_visitor_ids,
+     visit_num = V3,
+     visitor_browser = V4,
+     post_event_list = V5,
+     hit_time_gmt = V6,
+     post_page_event = V7,
+     post_pagename = V8
+  )
+
+```
+
+## Aggregating Visitor Features (Visitor Rollup)
+Next, we'll summarize every visitor based on some metrics and dimensions (you should choose features that are relevant to your business)
+
+```{r}
+basic_counts = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  summarize(
+    hit_count = n(),
+    lifetime_visits = max(visit_num),
+    visits = n_distinct(visit_num)
+  )
+
+#Counting events from the post_event_list using a regular expression to grab the multiple count instances
+event_to_count = "203"
+event_counts = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  filter(post_event_list %regexp% paste0(event_to_count)) %>%
+  mutate(true_counts = ifelse(post_event_list %regexp% paste0(event_to_count,"="),  as.numeric(regexp_extract(post_event_list, paste0(".*",event_to_count,"=([0-9]+).*"))),1)) %>%
+  summarize(
+    event_count = sum(true_counts)
+  )
+
+
+#Counting visits with where post_pagename contains a certain regular expression
+visit_counts = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  filter(post_pagename %regexp% "Interesting\\.PageName") %>%
+  summarize(
+    visits_to_interesting_page = n_distinct(visit_num)
+  )
+
+#Counting page views to Overview.Site page
+page_view_counts = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  filter(post_pagename %regexp% "Overview\\.Site" & post_page_event == 0) %>%
+  summarize(
+    page_views_to_site_overview = n()
+  )
+
+#Counting unique dates visited
+date_counts = data_feed_tbl %>%
+  group_by(visitor_id) %>%
+  summarize(
+    days_visited = n_distinct(from_unixtime(hit_time_gmt, "YYYY-MM-dd")),
+    months_visited = n_distinct(from_unixtime(hit_time_gmt, "YYYY-MM"))
+  )
+
+#Merging all of the counts into a single data frame
+visitor_rollup = list(basic_counts,event_counts,visit_counts,page_view_counts,date_counts) %>%
+  Reduce(function(...) merge(..., all=TRUE, by="visitor_id"), .)
+  
+#Converting NAs to 0
+visitor_rollup = visitor_rollup %>%
+  mutate_all(funs(ifelse(is.na(.),0,.)))
+
+#If it fits in memory (it usually does, unless you have hundreds of millions)
+local_visitor_rollup = visitor_rollup %>% collect()
+
+# Prebaked Example:
+rollup_example
+
+```
+
+## Building and visualizing a propensity model
+Using the visitor aggregations, we'll build a propensity model on a sample, then apply it to the entire population.
+
+```{r}
+propensity_rollup = visitor_rollup %>%
+  mutate(
+    response_var = ifelse(visits_to_admin_console > 0, 1, 0)
+  ) %>% select(-visits_to_admin_console)
+
+sample_size = 10000
+
+# Grab sample of visitors for building a propensity model
+sample_visitors = propensity_rollup %>%
+  top_n(sample_size, wt=visitor_id) %>%
+  collect()
+
+# Throw out single hit visitors
+clean_sample = sample_visitors %>%
+  filter(hit_count > 1) %>%
+  select(-visitor_id)
+
+# Train a propensity model
+prop_model = glm(response_var ~ ., family=binomial(), data=clean_sample)
+
+# If your rollup fits in memory:
+# If your rollup is so big that it doesn't fit in memory, try spark_apply
+propensity_scores = round(100*predict(prop_model, newdata=local_visitor_rollup, type="response"))
+propensity_histo = as.data.frame(table(propensity_scores))
+
+# Prebaked examples:
+p <- plot_ly(propensity_histo, x = ~ propensity_histo$propensity_scores, y = ~propensity_histo$Freq, type = 'bar') %>%
+  layout(yaxis = list(title = 'Number of Visitors', range=c(0,5000))) %>%
+  layout(xaxis = list(title = 'Propensity Score'))
+p
+summary(prop_model)
+
+```
+
